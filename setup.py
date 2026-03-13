@@ -1,19 +1,47 @@
 import json
 import os
+import platform
 import shutil
 import subprocess
 import sys
 import sysconfig
 from pathlib import Path
 
-import pybind11
-from setuptools import Extension, setup
-from setuptools.command.build_ext import build_ext
+PROJECT_ROOT = Path(__file__).resolve().parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+import pybind11  # noqa: E402
+from setuptools import Extension, setup  # noqa: E402
+from setuptools.command.build_ext import build_ext  # noqa: E402
+
+from build_support.vectordb_engine_variants import resolve_engine_extension_plan  # noqa: E402
+from build_support.x86_profiles import resolve_x86_build_config  # noqa: E402
 
 CMAKE_PATH = shutil.which("cmake") or "cmake"
 C_COMPILER_PATH = shutil.which("gcc") or "gcc"
 CXX_COMPILER_PATH = shutil.which("g++") or "g++"
 ENGINE_SOURCE_DIR = "src/"
+
+
+def _resolve_current_engine_plan():
+    x86_build_config = resolve_x86_build_config(os.environ, sys.argv)
+    return resolve_engine_extension_plan(
+        platform=sys.platform,
+        machine=platform.machine(),
+        x86_build_profile=x86_build_config.profile,
+        x86_simd_level=x86_build_config.simd_level,
+    )
+
+
+ENGINE_EXTENSION_PLAN = _resolve_current_engine_plan()
+ENGINE_VARIANTS_BY_MODULE = {
+    variant.module_name: variant for variant in ENGINE_EXTENSION_PLAN.variants
+}
+
+
+def _cmake_output_var_name(target_name: str) -> str:
+    return f"OV_OUTPUT_NAME_{target_name.upper()}"
 
 
 class OpenVikingBuildExt(build_ext):
@@ -324,25 +352,51 @@ class OpenVikingBuildExt(build_ext):
         ext_dir = ext_fullpath.parent.resolve()
         build_dir = Path(self.build_temp) / "cmake_build"
         build_dir.mkdir(parents=True, exist_ok=True)
+        variant = ENGINE_VARIANTS_BY_MODULE[ext.name]
+        self._ensure_engine_build_configured(ext_dir, build_dir, ext_fullpath)
+
+        if variant.target_name not in getattr(self, "_available_engine_targets", set()):
+            print(
+                f"Skipping unavailable engine variant target {variant.target_name} "
+                f"for extension {ext.name}"
+            )
+            return
 
         self._run_stage_with_artifact_checks(
             "CMake build",
-            lambda: self._build_extension_impl(ext_fullpath, ext_dir, build_dir),
+            lambda: self._build_extension_impl(build_dir, variant),
             [(ext_fullpath, f"native extension '{ext.name}'")],
         )
 
-    def _build_extension_impl(self, ext_fullpath, ext_dir, build_dir):
-        """Invoke CMake to build the Python native extension."""
-        py_output_name = ext_fullpath.stem
-        py_output_suffix = ext_fullpath.suffix
+    def _load_available_engine_targets(self, build_dir):
+        targets_file = build_dir / "engine_targets.txt"
+        if not targets_file.exists():
+            return set()
+        return {
+            line.strip()
+            for line in targets_file.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        }
+
+    def _ensure_engine_build_configured(self, ext_dir, build_dir, ext_fullpath):
+        if getattr(self, "_engine_build_configured", False):
+            return
+
+        x86_build_config = resolve_x86_build_config(os.environ, sys.argv)
+        print(
+            "Configuring x86 build profile="
+            f"{x86_build_config.profile} simd={x86_build_config.simd_level} "
+            f"baseline={x86_build_config.baseline} "
+            f"dispatch={'ON' if x86_build_config.dispatch_enabled else 'OFF'}"
+        )
 
         cmake_args = [
             f"-S{Path(ENGINE_SOURCE_DIR).resolve()}",
             f"-B{build_dir}",
             "-DCMAKE_BUILD_TYPE=Release",
-            f"-DPY_OUTPUT_DIR={ext_dir}",
-            f"-DPY_OUTPUT_NAME={py_output_name}",
-            f"-DPY_OUTPUT_SUFFIX={py_output_suffix}",
+            f"-DOV_ENGINE_OUTPUT_DIR={ext_dir}",
+            f"-DOV_PY_OUTPUT_SUFFIX={ext_fullpath.suffix}",
+            f"-DOV_ENGINE_VARIANTS={';'.join(v.variant_name for v in ENGINE_EXTENSION_PLAN.variants)}",
             "-DCMAKE_VERBOSE_MAKEFILE=ON",
             "-DCMAKE_INSTALL_RPATH=$ORIGIN",
             f"-DPython3_EXECUTABLE={sys.executable}",
@@ -351,8 +405,17 @@ class OpenVikingBuildExt(build_ext):
             f"-Dpybind11_DIR={pybind11.get_cmake_dir()}",
             f"-DCMAKE_C_COMPILER={C_COMPILER_PATH}",
             f"-DCMAKE_CXX_COMPILER={CXX_COMPILER_PATH}",
-            f"-DOV_X86_SIMD_LEVEL={os.environ.get('OV_X86_SIMD_LEVEL', 'AVX2')}",
+            f"-DOV_X86_BUILD_PROFILE={x86_build_config.profile}",
+            f"-DOV_X86_SIMD_LEVEL={x86_build_config.simd_level}",
+            f"-DOV_X86_PORTABLE_BASELINE={x86_build_config.baseline}",
+            f"-DOV_X86_DISPATCH={'ON' if x86_build_config.dispatch_enabled else 'OFF'}",
         ]
+        for configured_variant in ENGINE_EXTENSION_PLAN.variants:
+            variant_ext_fullpath = Path(self.get_ext_fullpath(configured_variant.module_name))
+            cmake_args.append(
+                f"-D{_cmake_output_var_name(configured_variant.target_name)}="
+                f"{variant_ext_fullpath.stem}"
+            )
 
         if sys.platform == "darwin":
             cmake_args.append("-DCMAKE_OSX_DEPLOYMENT_TARGET=10.15")
@@ -363,8 +426,20 @@ class OpenVikingBuildExt(build_ext):
             cmake_args.extend(["-G", "MinGW Makefiles"])
 
         self.spawn([self.cmake_executable] + cmake_args)
+        self._available_engine_targets = self._load_available_engine_targets(build_dir)
+        self._engine_build_configured = True
 
-        build_args = ["--build", str(build_dir), "--config", "Release", f"-j{os.cpu_count() or 4}"]
+    def _build_extension_impl(self, build_dir, variant):
+        """Build a configured engine target."""
+        build_args = [
+            "--build",
+            str(build_dir),
+            "--config",
+            "Release",
+            "--target",
+            variant.target_name,
+            f"-j{os.cpu_count() or 4}",
+        ]
         self.spawn([self.cmake_executable] + build_args)
 
 
@@ -373,10 +448,8 @@ setup(
     #     f"pyagfs @ file://localhost/{os.path.abspath('third_party/agfs/agfs-sdk/python')}"
     # ],
     ext_modules=[
-        Extension(
-            name="openviking.storage.vectordb.engine",
-            sources=[],
-        )
+        Extension(name=variant.module_name, sources=[])
+        for variant in ENGINE_EXTENSION_PLAN.variants
     ],
     cmdclass={
         "build_ext": OpenVikingBuildExt,

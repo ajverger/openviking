@@ -11,12 +11,20 @@
 #include "common/log_utils.h"
 #include "store/bytes_row.h"
 #include "py_accessors.h"
+#include "index/detail/vector/common/x86/simd_dispatch.h"
 
 namespace py = pybind11;
 namespace vdb = vectordb;
 
-PYBIND11_MODULE(engine, m) {
+#ifndef OV_PY_MODULE_NAME
+#define OV_PY_MODULE_NAME engine
+#endif
+
+PYBIND11_MODULE(OV_PY_MODULE_NAME, m) {
   m.def("init_logging", &vdb::init_logging, "Initialize logging");
+  m.def("get_simd_backend",
+        []() { return std::string(vdb::GetActiveSimdBackendName()); },
+        "Return the active SIMD backend");
 
   py::enum_<vdb::FieldType>(m, "FieldType")
       .value("int64", vdb::FieldType::INT64)
